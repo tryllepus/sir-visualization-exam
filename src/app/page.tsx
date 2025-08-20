@@ -59,6 +59,45 @@ function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
   }
 }
 
+// Barabási–Albert (BA)
+// Some nodes have a high-degree, while most have few
+function makeBA(n: number, m: number, seed = 1): Graph {
+  // n: total nodes; m: edges each new node adds (>=1, < n)
+  const rand = mulberry32(seed);
+  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0 }));
+  const links: Link[] = [];
+
+  // Start with a small connected seed of m+1 nodes (clique)
+  const init = Math.max(m + 1, 2);
+  for (let i = 0; i < init; i++) {
+    for (let j = i + 1; j < init; j++) links.push({ source: i, target: j });
+  }
+
+  // Degree list and "targets" array for linear-time PA via degree-proportional sampling
+  const deg = Array(n).fill(0);
+  for (const e of links) { deg[e.source as number]++; deg[e.target as number]++; }
+
+  // Multiset proportional to degree
+  const bag: number[] = [];
+  for (let i = 0; i < init; i++) for (let k = 0; k < deg[i]; k++) bag.push(i);
+
+  for (let v = init; v < n; v++) {
+    const targets = new Set<number>();
+    while (targets.size < Math.min(m, v)) {
+      const u = bag.length ? bag[Math.floor(rand() * bag.length)] : Math.floor(rand() * v);
+      if (u !== v) targets.add(u);
+    }
+    for (const u of targets) {
+      links.push({ source: v, target: u });
+      deg[v]++; deg[u]++;
+      // update bag incrementally
+      bag.push(v);              // once per new degree at v
+      bag.push(u);              // once per new degree at u
+    }
+  }
+  return { nodes, links };
+}
+
 // ---------- Gillespie SSA implementation ----------
 
 type SimResult = {
@@ -211,6 +250,7 @@ export default function Page() {
     setBusy(true);
     await new Promise((r) => setTimeout(r, 0)); // yield to paint
     const n = clamp(population, 10, 6000);
+    // Based on drop down
     const gg = makeWS(n, clamp(k, 2, 40), clamp(rewire, 0, 1), 1);
     const { times, timeline } = gillespieSIR(
       gg,
