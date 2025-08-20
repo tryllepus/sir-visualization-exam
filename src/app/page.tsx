@@ -446,28 +446,7 @@ export default function Page() {
                   }
                 />
 
-                <Paper withBorder p="sm">
-                  <Text size="xs" c="dimmed" mb={6}>
-                    Snapshot (fractions)
-                  </Text>
-                  <SnapshotBars />
-                  {simInfo && (
-                    <Group gap="xs" mt="xs">
-                      <Badge color="blue" variant="light">
-                        S: {simInfo.S}
-                      </Badge>
-                      <Badge color="red" variant="light">
-                        I: {simInfo.I}
-                      </Badge>
-                      <Badge color="teal" variant="light">
-                        R: {simInfo.R}
-                      </Badge>
-                      <Text size="xs" c="dimmed" ml="auto">
-                        N={simInfo.N}
-                      </Text>
-                    </Group>
-                  )}
-                </Paper>
+
               </Stack>
             </Paper>
           </Box>
@@ -520,7 +499,28 @@ export default function Page() {
                 <LinesChart />
               </Box>
             </Paper>
-
+            <Paper withBorder p="sm">
+              <Text size="xs" c="dimmed" mb={6}>
+                Snapshot (fractions)
+              </Text>
+              <SnapshotBars />
+              {simInfo && (
+                <Group gap="xs" mt="xs">
+                  <Badge color="blue" variant="light">
+                    S: {simInfo.S}
+                  </Badge>
+                  <Badge color="red" variant="light">
+                    I: {simInfo.I}
+                  </Badge>
+                  <Badge color="teal" variant="light">
+                    R: {simInfo.R}
+                  </Badge>
+                  <Text size="xs" c="dimmed" ml="auto">
+                    N={simInfo.N}
+                  </Text>
+                </Group>
+              )}
+            </Paper>
             <Paper withBorder style={{ height: '64vh', overflow: 'hidden' }}>
               {graph ? (
                 <ForceGraph2D
