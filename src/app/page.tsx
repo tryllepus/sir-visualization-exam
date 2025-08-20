@@ -1,20 +1,35 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
+import {
+  MantineProvider,
+  Flex,
+  Box,
+  Stack,
+  Group,
+  Title,
+  Text,
+  Button,
+  NumberInput,
+  Slider,
+  Select,
+  Paper,
+  Card,
+  Divider,
+  Badge,
+} from '@mantine/core';
 
-// Use the 2D canvas variant to avoid VR/AFRAME deps
+// 2D canvas force-graph (no VR deps)
 const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false });
 
-type Node = { id: number; state: number }; // 0=S,1=I,2=R
+type Node = { id: number; state: number }; // 0=S, 1=I, 2=R
 type Link = { source: number; target: number };
 type Graph = { nodes: Node[]; links: Link[] };
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
 }
-
-// Simple seeded RNG
 function mulberry32(a: number) {
   return function () {
     let t = (a += 0x6d2b79f5);
@@ -23,6 +38,8 @@ function mulberry32(a: number) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+/* ---------------- Graph generators ---------------- */
 
 // Watts–Strogatz small-world (O(N*k))
 function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
@@ -42,7 +59,6 @@ function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
     if (rand() < rewireProb) {
       const i = links[idx].source as number;
       let j = Math.floor(rand() * n);
-      // avoid self-loop & duplicate
       let tries = 0;
       while ((j === i || hasEdge(links, i, j)) && tries++ < 50) j = Math.floor(rand() * n);
       links[idx].target = j;
@@ -59,25 +75,20 @@ function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
   }
 }
 
-// Barabási–Albert (BA)
-// Some nodes have a high-degree, while most have few
+// Barabási–Albert (scale-free)
 function makeBA(n: number, m: number, seed = 1): Graph {
-  // n: total nodes; m: edges each new node adds (>=1, < n)
   const rand = mulberry32(seed);
   const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0 }));
   const links: Link[] = [];
-
-  // Start with a small connected seed of m+1 nodes (clique)
   const init = Math.max(m + 1, 2);
   for (let i = 0; i < init; i++) {
     for (let j = i + 1; j < init; j++) links.push({ source: i, target: j });
   }
-
-  // Degree list and "targets" array for linear-time PA via degree-proportional sampling
   const deg = Array(n).fill(0);
-  for (const e of links) { deg[e.source as number]++; deg[e.target as number]++; }
-
-  // Multiset proportional to degree
+  for (const e of links) {
+    deg[e.source as number]++;
+    deg[e.target as number]++;
+  }
   const bag: number[] = [];
   for (let i = 0; i < init; i++) for (let k = 0; k < deg[i]; k++) bag.push(i);
 
@@ -90,91 +101,44 @@ function makeBA(n: number, m: number, seed = 1): Graph {
     for (const u of targets) {
       links.push({ source: v, target: u });
       deg[v]++; deg[u]++;
-      // update bag incrementally
-      bag.push(v);              // once per new degree at v
-      bag.push(u);              // once per new degree at u
+      bag.push(v);
+      bag.push(u);
     }
   }
   return { nodes, links };
 }
 
-// ---------- Gillespie SSA implementation ----------
+/* ---------------- SIR simulation ---------------- */
 
-type SimResult = {
-  times: number[];          // t at each event (times[0] = 0)
-  timeline: Uint8Array[];   // state snapshot after each event (timeline[0] = initial)
-};
-
-function buildAdjacency(graph: Graph): number[][] {
+function simulateSIR(
+  graph: Graph,
+  steps: number,
+  beta: number,
+  gamma: number,
+  initialInfected: number,
+  seed = 2
+) {
   const n = graph.nodes.length;
+  const rand = mulberry32(seed);
   const adj: number[][] = Array.from({ length: n }, () => []);
   for (const e of graph.links) {
     const u = e.source as number, v = e.target as number;
     adj[u].push(v); adj[v].push(u);
   }
-  return adj;
-}
-
-function gillespieSIR(
-  graph: Graph,
-  beta: number,      // infection rate per S–I edge
-  gamma: number,     // recovery rate per I node
-  initialInfected: number,
-  seed = 2,
-  maxEvents = 20000, // cap on number of events to simulate
-  tMax = Infinity    // optional time horizon
-): SimResult {
-  const n = graph.nodes.length;
-  const rng = mulberry32(seed);
-  const U = () => Math.max(1e-12, Math.min(1 - 1e-12, rng())); // protect logs
-
-  const adj = buildAdjacency(graph);
-
-  // states: 0=S, 1=I, 2=R
-  const states = new Uint8Array(n);
-  // seed infections
+  const states = new Uint8Array(n); // 0 S, 1 I, 2 R
   const picked = new Set<number>();
   const target = Math.min(initialInfected, n);
-  while (picked.size < target) picked.add(Math.floor(rng() * n));
+  while (picked.size < target) picked.add(Math.floor(rand() * n));
   for (const j of picked) states[j] = 1;
 
   const timeline: Uint8Array[] = [states.slice()];
-  const times: number[] = [0];
-  let t = 0;
 
-  // Event loop
-  for (let ev = 0; ev < maxEvents; ev++) {
-    // Build event list with rates
-    let Rtot = 0;
-    // To avoid storing a big list, we’ll do one pass to get Rtot,
-    // and another pass to pick the event (alias of cumulative).
-    // Pass 1: total rate
-    for (let u = 0; u < n; u++) {
-      const s = states[u];
-      if (s === 0) {
-        // susceptible: beta * (# infected neighbors)
-        let m = 0;
-        const neigh = adj[u];
-        for (let k = 0; k < neigh.length; k++) if (states[neigh[k]] === 1) m++;
-        if (m > 0) Rtot += beta * m;
-      } else if (s === 1) {
-        Rtot += gamma; // recovery
-      }
-    }
+  const pRec = 1 - Math.exp(-gamma);
+  const pEdgeInf = 1 - Math.exp(-beta);
+  const scratch = new Uint8Array(n);
 
-    if (Rtot <= 0) break; // absorbing
-
-    // Draw waiting time: dt ~ Exp(Rtot)
-    const dt = -Math.log(U()) / Rtot;
-    t += dt;
-    if (t > tMax) break;
-
-    // Draw which event fires
-    let thresh = U() * Rtot;
-    let cum = 0;
-
-    // Pass 2: find event and apply it
-    let fired = false;
+  for (let t = 1; t <= steps; t++) {
+    scratch.set(states);
     for (let u = 0; u < n; u++) {
       const s = states[u];
       if (s === 0) {
@@ -182,241 +146,398 @@ function gillespieSIR(
         const neigh = adj[u];
         for (let k = 0; k < neigh.length; k++) if (states[neigh[k]] === 1) m++;
         if (m > 0) {
-          const r = beta * m;
-          if (cum + r >= thresh) {
-            // infection event at u
-            states[u] = 1;
-            fired = true;
-            break;
-          }
-          cum += r;
+          const pInf = 1 - Math.pow(1 - pEdgeInf, m);
+          if (rand() < pInf) scratch[u] = 1;
         }
       } else if (s === 1) {
-        const r = gamma;
-        if (cum + r >= thresh) {
-          // recovery event at u
-          states[u] = 2;
-          fired = true;
-          break;
-        }
-        cum += r;
+        if (rand() < pRec) scratch[u] = 2;
       }
     }
-
-    if (!fired) {
-      // Numerical fall-through (shouldn’t happen); stop to be safe
-      break;
-    }
-
-    // Record snapshot
+    states.set(scratch);
     timeline.push(states.slice());
-    times.push(t);
   }
-
-  return { times, timeline };
+  return timeline;
 }
 
-// --------------------------------------------------
+function seriesFromTimeline(timeline: Uint8Array[]) {
+  if (!timeline || !timeline.length) return null;
+  const n = timeline[0].length;
+  const S: number[] = [], I: number[] = [], R: number[] = [];
+  for (const arr of timeline) {
+    let s = 0, i = 0, r = 0;
+    for (let k = 0; k < arr.length; k++) {
+      const v = arr[k];
+      if (v === 0) s++; else if (v === 1) i++; else r++;
+    }
+    S.push(s); I.push(i); R.push(r);
+  }
+  const Sf = S.map(x => x / n), If = I.map(x => x / n), Rf = R.map(x => x / n);
+  return { S, I, R, Sf, If, Rf, N: n };
+}
+function linePath(data: number[], width: number, height: number) {
+  if (!data.length) return '';
+  const maxX = data.length - 1;
+  const sx = (i: number) => (i / maxX) * (width - 2) + 1;
+  const sy = (y: number) => (1 - y) * (height - 2) + 1;
+  let d = `M ${sx(0)} ${sy(data[0])}`;
+  for (let i = 1; i < data.length; i++) d += ` L ${sx(i)} ${sy(data[i])}`;
+  return d;
+}
+
+/* ---------------- Page ---------------- */
 
 export default function Page() {
-  // UI state
+  // Controls
   const [population, setPopulation] = useState(500);
-  const [k, setK] = useState(6);
-  const [rewire, setRewire] = useState(0.05);
-  const [beta, setBeta] = useState(0.15);
-  const [gamma, setGamma] = useState(0.3);
-  const [maxEvents, setMaxEvents] = useState(5000); // formerly "steps"
-  const [initInf, setInitInf] = useState(5);
+  const [graphType, setGraphType] = useState<'ws' | 'ba'>('ws');
 
+  // WS params
+  const [k, setK] = useState(12);
+  const [rewire, setRewire] = useState(0.05);
+
+  // BA params
+  const [mBA, setMBA] = useState(3);
+
+  // SIR params
+  const [beta, setBeta] = useState(0.18);
+  const [gamma, setGamma] = useState(0.25);
+  const [steps, setSteps] = useState(300);
+  const [initInf, setInitInf] = useState(10);
+
+  // State
   const [graph, setGraph] = useState<Graph | null>(null);
   const [timeline, setTimeline] = useState<Uint8Array[] | null>(null);
-  const [times, setTimes] = useState<number[] | null>(null);
-  const [idx, setIdx] = useState(0); // event index
+  const [t, setT] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const playRef = useRef<number | null>(null);
+
+  const series = useMemo(() => (timeline ? seriesFromTimeline(timeline) : null), [timeline]);
 
   const simInfo = useMemo(() => {
     if (!timeline) return null;
-    const states = timeline[idx];
+    const states = timeline[t];
     let S = 0, I = 0, R = 0;
-    for (let i = 0; i < states.length; i++) {
-      if (states[i] === 0) S++;
-      else if (states[i] === 1) I++;
-      else R++;
-    }
-    return { S, I, R };
-  }, [timeline, idx]);
+    for (let i = 0; i < states.length; i++) { const v = states[i]; if (v === 0) S++; else if (v === 1) I++; else R++; }
+    return { S, I, R, N: states.length };
+  }, [timeline, t]);
 
   const handleSimulate = async () => {
     setBusy(true);
-    await new Promise((r) => setTimeout(r, 0)); // yield to paint
+    await new Promise(r => setTimeout(r, 0));
     const n = clamp(population, 10, 6000);
-    // Based on drop down
-    const gg = makeWS(n, clamp(k, 2, 40), clamp(rewire, 0, 1), 1);
-    const { times, timeline } = gillespieSIR(
+    let gg: Graph;
+    if (graphType === 'ws') {
+      gg = makeWS(n, clamp(k, 2, 200), clamp(rewire, 0, 1), 1);
+    } else {
+      gg = makeBA(n, clamp(mBA, 1, Math.max(1, Math.floor(n / 5))), 1);
+    }
+    const tl = simulateSIR(
       gg,
+      clamp(steps, 1, 3000),
       beta,
       gamma,
       clamp(initInf, 1, Math.max(1, Math.floor(n * 0.1))),
-      2,
-      clamp(maxEvents, 1, 200000),
-      Infinity
+      2
     );
     setGraph(gg);
-    setTimeline(timeline);
-    setTimes(times);
-    setIdx(0);
+    setTimeline(tl);
+    setT(0);
     setBusy(false);
+    setPlaying(false);
   };
 
-  // color by state at current event
+  useEffect(() => {
+    if (!playing) {
+      if (playRef.current) cancelAnimationFrame(playRef.current);
+      playRef.current = null;
+      return;
+    }
+    const step = () => {
+      setT(prev => {
+        if (!timeline) return 0;
+        if (prev < timeline.length - 1) return prev + 1;
+        return prev;
+      });
+      playRef.current = requestAnimationFrame(step);
+    };
+    playRef.current = requestAnimationFrame(step);
+    return () => { if (playRef.current) cancelAnimationFrame(playRef.current); };
+  }, [playing, timeline]);
+
   const nodeCanvasObject = (node: any, ctx: CanvasRenderingContext2D) => {
-    const i = node.id as number;
-    const s = timeline ? timeline[idx][i] : 0;
-    const color = s === 0 ? '#1f77b4' : s === 1 ? '#d62728' : '#2ca02c'; // S/I/R
-    const r = 2.2;
+    const idx = node.id as number;
+    const s = timeline ? timeline[t][idx] : 0;
+    const color = s === 0 ? '#60a5fa' : s === 1 ? '#f87171' : '#34d399';
+    const r = 2.6;
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(node.x, node.y, r, 0, 2 * Math.PI, false);
     ctx.fill();
   };
 
+  const SnapshotBars = () => {
+    if (!simInfo) return null;
+    const { S, I, R, N } = simInfo;
+    const w = 240, h = 84, pad = 10;
+    const vals = [S / N, I / N, R / N];
+    const colors = ['#60a5fa', '#f87171', '#34d399'];
+    const bw = (w - pad * 4) / 3;
+    return (
+      <svg width={w} height={h}>
+        {vals.map((v, i) => {
+          const x = pad + i * (bw + pad);
+          const bh = Math.max(1, v * (h - pad * 2));
+          return <rect key={i} x={x} y={h - pad - bh} width={bw} height={bh} fill={colors[i]} rx={6} />;
+        })}
+        <text x={pad} y={16} fill="#94a3b8" fontSize={12}>{`t = ${t}`}</text>
+      </svg>
+    );
+  };
+
+  const LinesChart = () => {
+    if (!series) return null;
+    const { Sf, If, Rf } = series;
+    const W = 680, H = 200;
+    const dS = linePath(Sf, W, H);
+    const dI = linePath(If, W, H);
+    const dR = linePath(Rf, W, H);
+    const cursorX = timeline ? (t / (timeline.length - 1)) * (W - 2) + 1 : 1;
+    return (
+      <svg width={W} height={H}>
+        <rect x={0} y={0} width={W} height={H} rx={10} fill="#0b1220" />
+        <line x1={1} y1={H - 1} x2={W - 1} y2={H - 1} stroke="#1f2937" />
+        <line x1={1} y1={1} x2={1} y2={H - 1} stroke="#1f2937" />
+        <path d={dS} fill="none" stroke="#60a5fa" strokeWidth={3} />
+        <path d={dI} fill="none" stroke="#f87171" strokeWidth={3} />
+        <path d={dR} fill="none" stroke="#34d399" strokeWidth={3} />
+        <line x1={cursorX} y1={0} x2={cursorX} y2={H} stroke="#94a3b8" strokeDasharray="4 3" />
+      </svg>
+    );
+  };
+
   return (
-    <div className="min-h-screen p-4 flex flex-col gap-4">
-      <h1 style={{ fontSize: '1.4rem', fontWeight: 600 }}>SIR on a Network (Gillespie SSA)</h1>
+      <Flex direction="column" gap="md" p="md" style={{ minHeight: '100vh', background: '#0b0f1a' }}>
+        <Group justify="space-between">
+          <Title order={2}>SIR on a Network (interactive)</Title>
+          <Group gap="xs">
+            <Badge color="blue" size="lg">S</Badge>
+            <Badge color="red" size="lg">I</Badge>
+            <Badge color="teal" size="lg">R</Badge>
+          </Group>
+        </Group>
 
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(6, minmax(0,1fr))',
-          gap: '8px',
-          alignItems: 'end',
-        }}
-      >
-        <label>
-          Population
-          <input
-            type="number"
-            min={10}
-            max={6000}
-            value={population}
-            onChange={(e) => setPopulation(parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          k (avg degree≈k)
-          <input
-            type="number"
-            min={2}
-            max={40}
-            step={2}
-            value={k}
-            onChange={(e) => setK(parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          rewire p
-          <input
-            type="number"
-            min={0}
-            max={1}
-            step={0.01}
-            value={rewire}
-            onChange={(e) => setRewire(parseFloat(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          β (infection rate)
-          <input
-            type="number"
-            min={0}
-            max={2}
-            step={0.01}
-            value={beta}
-            onChange={(e) => setBeta(parseFloat(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          γ (recovery rate)
-          <input
-            type="number"
-            min={0}
-            max={2}
-            step={0.01}
-            value={gamma}
-            onChange={(e) => setGamma(parseFloat(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          initial infected
-          <input
-            type="number"
-            min={1}
-            max={1000}
-            value={initInf}
-            onChange={(e) => setInitInf(parseInt(e.target.value || '0'))}
-          />
-        </label>
+        {/* Two-column: left sidebar fixed, right flexible */}
+        <Flex gap="md" align="stretch">
+          {/* Sidebar */}
+          <Box w={360}>
+            <Paper withBorder p="md">
+              <Stack gap="sm">
+                <Title order={4}>Controls</Title>
 
-        <label>
-          max events
-          <input
-            type="number"
-            min={10}
-            max={200000}
-            value={maxEvents}
-            onChange={(e) => setMaxEvents(parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <button onClick={handleSimulate} disabled={busy} style={{ gridColumn: 'span 2' }}>
-          {busy ? 'Simulating…' : 'Simulate'}
-        </button>
+                <NumberInput
+                  label="Population"
+                  min={10}
+                  max={6000}
+                  value={population}
+                  onChange={(v) => setPopulation(Number(v) || 0)}
+                />
 
-        <div style={{ gridColumn: 'span 3', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <input
-            type="range"
-            min={0}
-            max={(timeline?.length ?? 1) - 1}
-            value={idx}
-            onChange={(e) => setIdx(parseInt(e.target.value || '0'))}
-            style={{ width: '100%' }}
-            disabled={!timeline}
-          />
-          <span>
-            event: {idx}/{(timeline?.length ?? 1) - 1}
-            {times && times.length > 0 ? ` • time t ≈ ${times[idx].toFixed(3)}` : ''}
-          </span>
-        </div>
-      </div>
+                <Select
+                  label="Graph type"
+                  value={graphType}
+                  onChange={(v) => setGraphType((v as 'ws' | 'ba') ?? 'ws')}
+                  data={[
+                    { value: 'ws', label: 'Watts–Strogatz (small-world)' },
+                    { value: 'ba', label: 'Barabási–Albert (scale-free)' },
+                  ]}
+                />
 
-      <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-        <div>
-          Legend: <span style={{ color: '#1f77b4' }}>● S</span>{' '}
-          <span style={{ color: '#d62728' }}>● I</span>{' '}
-          <span style={{ color: '#2ca02c' }}>● R</span>
-        </div>
-        {simInfo && (
-          <div>
-            Counts @event {idx}: S={simInfo.S} | I={simInfo.I} | R={simInfo.R}
-          </div>
-        )}
-      </div>
+                {graphType === 'ws' && (
+                  <>
+                    <NumberInput
+                      label="k (avg degree ≈ k)"
+                      min={2}
+                      max={200}
+                      step={2}
+                      value={k}
+                      onChange={(v) => setK(Number(v) || 0)}
+                    />
+                    <NumberInput
+                      label="rewire p"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={rewire}
+                      onChange={(v) => setRewire(Number(v) || 0)}
+                    />
+                  </>
+                )}
 
-      <div style={{ height: '70vh', border: '1px solid #ddd', borderRadius: 8 }}>
-        {graph ? (
-          <ForceGraph2D
-            graphData={graph}
-            cooldownTicks={50}
-            nodeRelSize={1}
-            nodeLabel={(n: any) => `id: ${n.id}`}
-            linkColor={() => 'rgba(120,120,120,0.3)'}
-            nodeCanvasObject={nodeCanvasObject}
-          />
-        ) : (
-          <div style={{ padding: 16 }}>
-            Click <b>Simulate</b> to generate a graph and run SIR (Gillespie).
-          </div>
-        )}
-      </div>
-    </div>
+                {graphType === 'ba' && (
+                  <NumberInput
+                    label="m (new edges per node)"
+                    min={1}
+                    max={Math.max(1, Math.floor(population / 5))}
+                    value={mBA}
+                    onChange={(v) => setMBA(Number(v) || 0)}
+                  />
+                )}
+
+                <Divider label="SIR parameters" labelPosition="center" />
+
+                <NumberInput
+                  label="β (infection)"
+                  min={0}
+                  max={2}
+                  step={0.01}
+                  value={beta}
+                  onChange={(v) => setBeta(Number(v) || 0)}
+                />
+                <NumberInput
+                  label="γ (recovery)"
+                  min={0}
+                  max={2}
+                  step={0.01}
+                  value={gamma}
+                  onChange={(v) => setGamma(Number(v) || 0)}
+                />
+                <NumberInput
+                  label="initial infected"
+                  min={1}
+                  max={1000}
+                  value={initInf}
+                  onChange={(v) => setInitInf(Number(v) || 0)}
+                />
+                <NumberInput
+                  label="steps"
+                  min={10}
+                  max={3000}
+                  value={steps}
+                  onChange={(v) => setSteps(Number(v) || 0)}
+                />
+
+                <Group grow mt="xs">
+                  <Button onClick={handleSimulate} loading={busy}>
+                    {busy ? 'Simulating…' : 'Simulate'}
+                  </Button>
+                  <Button variant="outline" onClick={() => setPlaying((p) => !p)} disabled={!timeline}>
+                    {playing ? 'Pause' : 'Play'}
+                  </Button>
+                </Group>
+
+                <Divider my="xs" />
+                <Text size="sm" c="dimmed">
+                  Scrub time
+                </Text>
+                <Slider
+                  min={0}
+                  max={(timeline?.length ?? 1) - 1}
+                  value={t}
+                  onChange={setT}
+                  disabled={!timeline}
+                  marks={
+                    timeline
+                      ? [
+                          { value: 0, label: '0' },
+                          { value: timeline.length - 1, label: String(timeline.length - 1) },
+                        ]
+                      : [{ value: 0, label: '0' }]
+                  }
+                />
+
+                <Paper withBorder p="sm">
+                  <Text size="xs" c="dimmed" mb={6}>
+                    Snapshot (fractions)
+                  </Text>
+                  <SnapshotBars />
+                  {simInfo && (
+                    <Group gap="xs" mt="xs">
+                      <Badge color="blue" variant="light">
+                        S: {simInfo.S}
+                      </Badge>
+                      <Badge color="red" variant="light">
+                        I: {simInfo.I}
+                      </Badge>
+                      <Badge color="teal" variant="light">
+                        R: {simInfo.R}
+                      </Badge>
+                      <Text size="xs" c="dimmed" ml="auto">
+                        N={simInfo.N}
+                      </Text>
+                    </Group>
+                  )}
+                </Paper>
+              </Stack>
+            </Paper>
+          </Box>
+
+          {/* Main */}
+          <Flex direction="column" gap="md" style={{ flex: 1, minWidth: 0 }}>
+            <Group grow>
+              <Card withBorder>
+                <Text size="sm" c="dimmed">
+                  Susceptible
+                </Text>
+                <Title order={3} c="blue">
+                  {simInfo?.S ?? 0}
+                </Title>
+              </Card>
+              <Card withBorder>
+                <Text size="sm" c="dimmed">
+                  Infected
+                </Text>
+                <Title order={3} c="red">
+                  {simInfo?.I ?? 0}
+                </Title>
+              </Card>
+              <Card withBorder>
+                <Text size="sm" c="dimmed">
+                  Recovered
+                </Text>
+                <Title order={3} c="teal">
+                  {simInfo?.R ?? 0}
+                </Title>
+              </Card>
+              <Card withBorder>
+                <Text size="sm" c="dimmed">
+                  Time step
+                </Text>
+                <Title order={3}>{t}</Title>
+              </Card>
+            </Group>
+
+            <Paper withBorder p="md">
+              <Group justify="space-between" mb="xs">
+                <Title order={4}>S / I / R (fractions)</Title>
+                <Group gap="xs">
+                  <Badge color="blue">S</Badge>
+                  <Badge color="red">I</Badge>
+                  <Badge color="teal">R</Badge>
+                </Group>
+              </Group>
+              <Box style={{ overflowX: 'auto' }}>
+                <LinesChart />
+              </Box>
+            </Paper>
+
+            <Paper withBorder style={{ height: '64vh', overflow: 'hidden' }}>
+              {graph ? (
+                <ForceGraph2D
+                  graphData={graph}
+                  cooldownTicks={50}
+                  nodeRelSize={1}
+                  linkColor={() => 'rgba(156,163,175,0.25)'}
+                  nodeCanvasObject={nodeCanvasObject}
+                />
+              ) : (
+                <Group p="lg">
+                  <Text c="dimmed">Click <b>Simulate</b> to generate a graph and run SIR.</Text>
+                </Group>
+              )}
+            </Paper>
+          </Flex>
+        </Flex>
+      </Flex>
   );
 }
