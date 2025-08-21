@@ -23,7 +23,8 @@ import {
 // 2D canvas force-graph (no VR deps)
 const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false });
 
-type Node = { id: number; state: number }; // 0=S, 1=I, 2=R
+// Resistance is the weight: Each time a node gets infected, we utilize the weight to weight the probaility of getting infected again
+type Node = { id: number; state: number; resistance: number }; // 0=S, 1=I, 2=R
 type Link = { source: number; target: number };
 type Graph = { nodes: Node[]; links: Link[] };
 
@@ -45,7 +46,8 @@ function mulberry32(a: number) {
 function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
   if (k % 2 !== 0) k += 1;
   const rand = mulberry32(seed);
-  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0 }));
+  // Init with restistance 0, since they havent been infected
+  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0 }));
   const links: Link[] = [];
   // ring lattice
   for (let i = 0; i < n; i++) {
@@ -78,7 +80,7 @@ function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
 // Barabási–Albert (scale-free)
 function makeBA(n: number, m: number, seed = 1): Graph {
   const rand = mulberry32(seed);
-  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0 }));
+  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0  }));
   const links: Link[] = [];
   const init = Math.max(m + 1, 2);
   for (let i = 0; i < init; i++) {
@@ -115,17 +117,26 @@ function simulateSIR(
   steps: number,
   beta: number,
   gamma: number,
+  delta: number, // not used now if immunity is permanent
   initialInfected: number,
-  seed = 2
+  seed = 2,
+  gain = 0.25 // resistance gained each recovery (cap at 1)
 ) {
   const n = graph.nodes.length;
   const rand = mulberry32(seed);
+
+  // build adjacency
   const adj: number[][] = Array.from({ length: n }, () => []);
   for (const e of graph.links) {
     const u = e.source as number, v = e.target as number;
     adj[u].push(v); adj[v].push(u);
   }
-  const states = new Uint8Array(n); // 0 S, 1 I, 2 R
+
+  // states: 0=S, 1=I, 2=R (R means fully immune: resistance === 1)
+  const states = new Uint8Array(n);
+  const resistance = new Float32Array(n); // per-node resistance in [0,1]
+
+  // seed infections
   const picked = new Set<number>();
   const target = Math.min(initialInfected, n);
   while (picked.size < target) picked.add(Math.floor(rand() * n));
@@ -133,31 +144,55 @@ function simulateSIR(
 
   const timeline: Uint8Array[] = [states.slice()];
 
+  // per-step probabilities
   const pRec = 1 - Math.exp(-gamma);
   const pEdgeInf = 1 - Math.exp(-beta);
+
   const scratch = new Uint8Array(n);
 
   for (let t = 1; t <= steps; t++) {
     scratch.set(states);
+
     for (let u = 0; u < n; u++) {
       const s = states[u];
+
       if (s === 0) {
+        // S → I (scaled by lack of resistance)
         let m = 0;
         const neigh = adj[u];
         for (let k = 0; k < neigh.length; k++) if (states[neigh[k]] === 1) m++;
         if (m > 0) {
-          const pInf = 1 - Math.pow(1 - pEdgeInf, m);
-          if (rand() < pInf) scratch[u] = 1;
+          const baseInf = 1 - Math.pow(1 - pEdgeInf, m);
+          const scaledInf = baseInf * (1 - resistance[u]); // resistance reduces infection risk
+          if (rand() < scaledInf) scratch[u] = 1;
         }
+
       } else if (s === 1) {
-        if (rand() < pRec) scratch[u] = 2;
+        // I → (R if fully immune, else S) with resistance gain
+        if (rand() < pRec) {
+          const newRes = Math.min(1, resistance[u] + gain);
+          resistance[u] = newRes;
+          if (newRes >= 1) {
+            scratch[u] = 2; // fully immune forever
+          } else {
+            scratch[u] = 0; // back to S with partial resistance
+          }
+        }
+
+      } else if (s === 2) {
+        // R = fully immune forever ⇒ nothing changes
+        scratch[u] = 2;
       }
     }
+
     states.set(scratch);
     timeline.push(states.slice());
   }
+
   return timeline;
 }
+
+
 
 function seriesFromTimeline(timeline: Uint8Array[]) {
   if (!timeline || !timeline.length) return null;
@@ -201,6 +236,7 @@ export default function Page() {
   // SIR params
   const [beta, setBeta] = useState(0.18);
   const [gamma, setGamma] = useState(0.25);
+  const [delta, setDelta] = useState(0.05);
   const [steps, setSteps] = useState(300);
   const [initInf, setInitInf] = useState(10);
 
@@ -401,6 +437,14 @@ export default function Page() {
                   step={0.01}
                   value={gamma}
                   onChange={(v) => setGamma(Number(v) || 0)}
+                />
+                <NumberInput
+                  label="Delta (re-infection)"
+                  min={0}
+                  max={2}
+                  step={0.01}
+                  value={delta}
+                  onChange={(v) => setDelta(Number(v) || 0)}
                 />
                 <NumberInput
                   label="initial infected"
