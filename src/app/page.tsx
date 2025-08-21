@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import {
-  MantineProvider,
   Flex,
   Box,
   Stack,
@@ -223,8 +222,44 @@ function linePath(data: number[], width: number, height: number) {
 
 export default function Page() {
   // Controls
-  const [population, setPopulation] = useState(500);
-  const [graphType, setGraphType] = useState<'ws' | 'ba'>('ws');
+  const [population, setPopulation] = useState(100);
+  const [graphType, setGraphType] = useState<'ws' | 'ba' | 'cluster'>('ws');
+  // Cluster params
+  const [numClusters, setNumClusters] = useState(4);
+  const [intraK, setIntraK] = useState(10);
+  const [interP, setInterP] = useState(0.01);
+// Clustered graph: n nodes split into c clusters, each cluster is a WS, sparse random inter-cluster links
+function makeClustered(n: number, c: number, k: number, interProb: number, seed = 1): Graph {
+  const rand = mulberry32(seed);
+  const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0 }));
+  const links: Link[] = [];
+  const clusterSize = Math.floor(n / c);
+  const clusters: number[][] = [];
+  let idx = 0;
+  for (let ci = 0; ci < c; ci++) {
+    const size = ci === c - 1 ? n - idx : clusterSize;
+    const cluster = [];
+    for (let j = 0; j < size; j++) cluster.push(idx++);
+    clusters.push(cluster);
+    // Intra-cluster WS
+    const ws = makeWS(cluster.length, k, 0.05, seed + ci + 1);
+    // Remap node ids
+    for (const l of ws.links) {
+      links.push({ source: cluster[l.source as number], target: cluster[l.target as number] });
+    }
+  }
+  // Inter-cluster random links
+  for (let i = 0; i < c; i++) {
+    for (let j = i + 1; j < c; j++) {
+      for (const u of clusters[i]) {
+        for (const v of clusters[j]) {
+          if (rand() < interProb) links.push({ source: u, target: v });
+        }
+      }
+    }
+  }
+  return { nodes, links };
+}
 
   // WS params
   const [k, setK] = useState(12);
@@ -234,11 +269,13 @@ export default function Page() {
   const [mBA, setMBA] = useState(3);
 
   // SIR params
-  const [beta, setBeta] = useState(0.18);
-  const [gamma, setGamma] = useState(0.25);
+  const [beta, setBeta] = useState(0.02);
+  const [gamma, setGamma] = useState(0.02);
   const [delta, setDelta] = useState(0.05);
   const [steps, setSteps] = useState(300);
   const [initInf, setInitInf] = useState(10);
+  // Hvis brugeren ikke har valgt seed, brug random seed (baseret på tid)
+  const [simSeed, setSimSeed] = useState(0); // 0 = random hver gang
 
   // State
   const [graph, setGraph] = useState<Graph | null>(null);
@@ -262,19 +299,30 @@ export default function Page() {
     setBusy(true);
     await new Promise(r => setTimeout(r, 0));
     const n = clamp(population, 10, 6000);
+  // Hvis seed er 0 eller falsy, brug random seed VED HVER SIMULERING
+  const usedSeed = simSeed ? simSeed : Math.floor(Math.random() * 1e9) + 1;
     let gg: Graph;
     if (graphType === 'ws') {
-      gg = makeWS(n, clamp(k, 2, 200), clamp(rewire, 0, 1), 1);
+      gg = makeWS(n, clamp(k, 2, 200), clamp(rewire, 0, 1), usedSeed);
+    } else if (graphType === 'ba') {
+      gg = makeBA(n, clamp(mBA, 1, Math.max(1, Math.floor(n / 5))), usedSeed);
     } else {
-      gg = makeBA(n, clamp(mBA, 1, Math.max(1, Math.floor(n / 5))), 1);
+      gg = makeClustered(
+        n,
+        clamp(numClusters, 2, Math.max(2, Math.floor(n / 10))),
+        clamp(intraK, 2, 100),
+        clamp(interP, 0, 1),
+        usedSeed
+      );
     }
     const tl = simulateSIR(
       gg,
       clamp(steps, 1, 3000),
       beta,
       gamma,
-      clamp(initInf, 1, Math.max(1, Math.floor(n * 0.1))),
-      2
+      delta,
+      clamp(initInf, 1, n),
+      usedSeed
     );
     setGraph(gg);
     setTimeline(tl);
@@ -302,7 +350,7 @@ export default function Page() {
   }, [playing, timeline]);
 
   const nodeCanvasObject = (node: any, ctx: CanvasRenderingContext2D) => {
-    const idx = node.id as number;
+    const idx = node.id as number;  
     const s = timeline ? timeline[t][idx] : 0;
     const color = s === 0 ? '#60a5fa' : s === 1 ? '#f87171' : '#34d399';
     const r = 2.6;
@@ -355,7 +403,7 @@ export default function Page() {
   return (
       <Flex direction="column" gap="md" p="md" style={{ minHeight: '100vh', background: '#0b0f1a' }}>
         <Group justify="space-between">
-          <Title order={2}>SIR on a Network (interactive)</Title>
+          <Title order={2} style={{color: 'white'}}>SIR on a Network (interactive)</Title>
           <Group gap="xs">
             <Badge color="blue" size="lg">S</Badge>
             <Badge color="red" size="lg">I</Badge>
@@ -367,7 +415,7 @@ export default function Page() {
         <Flex gap="md" align="stretch">
           {/* Sidebar */}
           <Box w={360}>
-            <Paper withBorder p="md">
+            <Paper style={{padding: 40}}>
               <Stack gap="sm">
                 <Title order={4}>Controls</Title>
 
@@ -382,12 +430,40 @@ export default function Page() {
                 <Select
                   label="Graph type"
                   value={graphType}
-                  onChange={(v) => setGraphType((v as 'ws' | 'ba') ?? 'ws')}
+                  onChange={(v) => setGraphType((v as 'ws' | 'ba' | 'cluster') ?? 'ws')}
                   data={[
-                    { value: 'ws', label: 'Watts–Strogatz (small-world)' },
-                    { value: 'ba', label: 'Barabási–Albert (scale-free)' },
+                    { value: 'ws', label: 'Topology 1 (WS)' },
+                    { value: 'ba', label: 'Topology 2 (BA)' },
+                    { value: 'cluster', label: 'Topology 3 (Clusters)' },
                   ]}
                 />
+                {graphType === 'cluster' && (
+                  <>
+                    <NumberInput
+                      label="Amount of clusters"
+                      min={2}
+                      max={Math.max(2, Math.floor(population / 10))}
+                      value={numClusters}
+                      onChange={(v) => setNumClusters(Number(v) || 0)}
+                    />
+                    <NumberInput
+                      label="Intra cluster k (ws average)"
+                      min={2}
+                      max={100}
+                      step={2}
+                      value={intraK}
+                      onChange={(v) => setIntraK(Number(v) || 0)}
+                    />
+                    <NumberInput
+                      label="Intra cluster p"
+                      min={0}
+                      max={1}
+                      step={0.001}
+                      value={interP}
+                      onChange={(v) => setInterP(Number(v) || 0)}
+                    />
+                  </>
+                )}
 
                 {graphType === 'ws' && (
                   <>
@@ -422,6 +498,14 @@ export default function Page() {
 
                 <Divider label="SIR parameters" labelPosition="center" />
 
+                <NumberInput
+                  label="Seed (random, blank = ny hver gang)"
+                  min={0}
+                  max={999999}
+                  value={simSeed}
+                  onChange={(v) => setSimSeed(Number(v) || 0)}
+                  placeholder="(tom = random)"
+                />
                 <NumberInput
                   label="β (infection)"
                   min={0}
