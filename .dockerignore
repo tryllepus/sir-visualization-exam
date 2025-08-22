@@ -6,4 +6,3 @@ Dockerfile
 infra
 README.md
 npm-debug.log*
-.env*
