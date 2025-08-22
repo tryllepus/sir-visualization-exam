@@ -11,6 +11,7 @@ RUN npm ci
 
 # ---- Builder ----
 FROM node:20-bookworm-slim AS builder
+
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .

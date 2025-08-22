@@ -19,7 +19,6 @@ import {
   Badge,
 } from '@mantine/core';
 
-// 2D canvas force-graph (no VR deps)
 const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false });
 
 // Resistance is the weight: Each time a node gets infected, we utilize the weight to weight the probaility of getting infected again
@@ -39,13 +38,11 @@ function mulberry32(a: number) {
   };
 }
 
-/* ---------------- Graph generators ---------------- */
-
-// Watts–Strogatz small-world (O(N*k))
+// small world (we choose an average k)
 function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
   if (k % 2 !== 0) k += 1;
   const rand = mulberry32(seed);
-  // Init with restistance 0, since they havent been infected
+  // we start with restistance 0 since they havent been infected
   const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0 }));
   const links: Link[] = [];
   // ring lattice
@@ -76,7 +73,7 @@ function makeWS(n: number, k: number, rewireProb: number, seed = 1): Graph {
   }
 }
 
-// Barabási–Albert (scale-free)
+// super spreder
 function makeBA(n: number, m: number, seed = 1): Graph {
   const rand = mulberry32(seed);
   const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0  }));
@@ -109,31 +106,29 @@ function makeBA(n: number, m: number, seed = 1): Graph {
   return { nodes, links };
 }
 
-/* ---------------- SIR simulation ---------------- */
-
+// sir
 function simulateSIR(
   graph: Graph,
   steps: number,
   beta: number,
   gamma: number,
-  delta: number, // not used now if immunity is permanent
+  delta: number,
   initialInfected: number,
   seed = 2,
-  gain = 0.25 // resistance gained each recovery (cap at 1)
+  gain = 0.25
 ) {
   const n = graph.nodes.length;
   const rand = mulberry32(seed);
 
-  // build adjacency
+  // build adjacence
   const adj: number[][] = Array.from({ length: n }, () => []);
   for (const e of graph.links) {
     const u = e.source as number, v = e.target as number;
     adj[u].push(v); adj[v].push(u);
   }
 
-  // states: 0=S, 1=I, 2=R (R means fully immune: resistance === 1)
   const states = new Uint8Array(n);
-  const resistance = new Float32Array(n); // per-node resistance in [0,1]
+  const resistance = new Float32Array(n);
 
   // seed infections
   const picked = new Set<number>();
@@ -143,7 +138,7 @@ function simulateSIR(
 
   const timeline: Uint8Array[] = [states.slice()];
 
-  // per-step probabilities
+  // per step probabilities
   const pRec = 1 - Math.exp(-gamma);
   const pEdgeInf = 1 - Math.exp(-beta);
 
@@ -156,7 +151,6 @@ function simulateSIR(
       const s = states[u];
 
       if (s === 0) {
-        // S → I (scaled by lack of resistance)
         let m = 0;
         const neigh = adj[u];
         for (let k = 0; k < neigh.length; k++) if (states[neigh[k]] === 1) m++;
@@ -167,19 +161,17 @@ function simulateSIR(
         }
 
       } else if (s === 1) {
-        // I → (R if fully immune, else S) with resistance gain
         if (rand() < pRec) {
           const newRes = Math.min(1, resistance[u] + gain);
           resistance[u] = newRes;
           if (newRes >= 1) {
-            scratch[u] = 2; // fully immune forever
+            scratch[u] = 2; // immune
           } else {
             scratch[u] = 0; // back to S with partial resistance
           }
         }
 
       } else if (s === 2) {
-        // R = fully immune forever ⇒ nothing changes
         scratch[u] = 2;
       }
     }
@@ -218,7 +210,7 @@ function linePath(data: number[], width: number, height: number) {
   return d;
 }
 
-/* ---------------- Page ---------------- */
+//page
 
 export default function Page() {
   // Controls
@@ -228,7 +220,8 @@ export default function Page() {
   const [numClusters, setNumClusters] = useState(4);
   const [intraK, setIntraK] = useState(10);
   const [interP, setInterP] = useState(0.01);
-// Clustered graph: n nodes split into c clusters, each cluster is a WS, sparse random inter-cluster links
+
+
 function makeClustered(n: number, c: number, k: number, interProb: number, seed = 1): Graph {
   const rand = mulberry32(seed);
   const nodes: Node[] = Array.from({ length: n }, (_, i) => ({ id: i, state: 0, resistance: 0 }));
@@ -241,14 +234,14 @@ function makeClustered(n: number, c: number, k: number, interProb: number, seed 
     const cluster = [];
     for (let j = 0; j < size; j++) cluster.push(idx++);
     clusters.push(cluster);
-    // Intra-cluster WS
+    // connections within clusters, we choose average k (small world)
     const ws = makeWS(cluster.length, k, 0.05, seed + ci + 1);
     // Remap node ids
     for (const l of ws.links) {
       links.push({ source: cluster[l.source as number], target: cluster[l.target as number] });
     }
   }
-  // Inter-cluster random links
+  // choose possibility of connections between clusters
   for (let i = 0; i < c; i++) {
     for (let j = i + 1; j < c; j++) {
       for (const u of clusters[i]) {
@@ -274,8 +267,7 @@ function makeClustered(n: number, c: number, k: number, interProb: number, seed 
   const [delta, setDelta] = useState(0.05);
   const [steps, setSteps] = useState(300);
   const [initInf, setInitInf] = useState(10);
-  // Hvis brugeren ikke har valgt seed, brug random seed (baseret på tid)
-  const [simSeed, setSimSeed] = useState(0); // 0 = random hver gang
+  const [simSeed, setSimSeed] = useState(0);
 
   // State
   const [graph, setGraph] = useState<Graph | null>(null);
@@ -299,7 +291,7 @@ function makeClustered(n: number, c: number, k: number, interProb: number, seed 
     setBusy(true);
     await new Promise(r => setTimeout(r, 0));
     const n = clamp(population, 10, 6000);
-  // Hvis seed er 0 eller falsy, brug random seed VED HVER SIMULERING
+
   const usedSeed = simSeed ? simSeed : Math.floor(Math.random() * 1e9) + 1;
     let gg: Graph;
     if (graphType === 'ws') {
@@ -411,7 +403,6 @@ function makeClustered(n: number, c: number, k: number, interProb: number, seed 
           </Group>
         </Group>
 
-        {/* Two-column: left sidebar fixed, right flexible */}
         <Flex gap="md" align="stretch">
           {/* Sidebar */}
           <Box w={360}>
@@ -499,12 +490,12 @@ function makeClustered(n: number, c: number, k: number, interProb: number, seed 
                 <Divider label="SIR parameters" labelPosition="center" />
 
                 <NumberInput
-                  label="Seed (random, blank = ny hver gang)"
+                  label="Seed"
                   min={0}
                   max={999999}
                   value={simSeed}
                   onChange={(v) => setSimSeed(Number(v) || 0)}
-                  placeholder="(tom = random)"
+                  placeholder=""
                 />
                 <NumberInput
                   label="β (infection)"
